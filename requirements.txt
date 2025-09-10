@@ -3,5 +3,5 @@ gunicorn
 PyMuPDF
 pandas
 openpyxl
+google-generativeai==0.8.5
 
-google-generativeai>=0.9.0

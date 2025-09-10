@@ -1,0 +1,6 @@
+Flask
+gunicorn
+PyMuPDF
+pandas
+openpyxl
+google-generativeai>=0.9.0

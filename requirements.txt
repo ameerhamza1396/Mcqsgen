@@ -1,8 +1,4 @@
 Flask
 gunicorn
-pdfplumber
-pandas
-openpyxl
 google-generativeai==0.8.5
-
-
+pdfplumber

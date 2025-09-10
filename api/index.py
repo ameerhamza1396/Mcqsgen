@@ -1,189 +1,102 @@
-from flask import Flask, request, jsonify, send_file
-from werkzeug.utils import secure_filename
-import fitz # PyMuPDF
-import pandas as pd
+from http.server import BaseHTTPRequestHandler
+import cgi
 import json
 import os
-import re
-import google.generativeai as genai
-import traceback
 import io
+import google.generativeai as genai
+import pdfplumber
 
-app = Flask(__name__)
-
-# --- MCQ Prompt (Dynamic based on number of options) ---
-def get_mcq_prompt(num_options):
-    options = ["A", "B", "C", "D"]
-    if num_options == 5:
-        options.append("E")
-    
-    option_keys = [f"`option_{opt.lower()}`" for opt in options]
-
-    prompt_template = f"""
-You are an expert educator and assessment creator. Your task is to meticulously analyze the provided text and formulate challenging multiple-choice questions (MCQs).
-For each distinct and crucial piece of information, generate ONE highly challenging MCQ.
-Output ONLY a valid JSON array of MCQ objects. Each object MUST contain the following keys:
-- `question`: The full MCQ question string.
-- {",\n- ".join(option_keys)}: The text for each option.
-- `correct_answer`: The letter of the correct option (must be "A", "B", "C", "D", or "E").
-- `explanation`: A detailed explanation for the correct answer.
-- `topic`: The inferred specific topic of the MCQ.
-- `chapter`: The inferred chapter from which the information is drawn.
-- `subject`: The overarching subject.
-
-If fewer than {num_options} meaningful options can be extracted, generate additional plausible but incorrect distractors.  
-If any question is incomplete or unclear, refine and fix it before outputting.  
-Ensure that the correct answer is always properly validated with a clear explanation.
----
-{{text_chunk}}
----
-"""
-    return prompt_template
-
-def extract_text_from_pdf(pdf_path):
-    """Extracts all text content from a given PDF file."""
-    try:
-        document = fitz.open(pdf_path)
-        text = "".join(page.get_text() for page in document)
-        document.close()
-        return text
-    except Exception as e:
-        return None
-
-def call_gemini_api(text_chunk, prompt_template, api_key):
-    """A generic function to call the Gemini API with retry logic."""
-    GEMINI_MODEL = 'gemini-2.5-flash'
-    retries = 3
-
-    for i in range(retries):
+class handler(BaseHTTPRequestHandler):
+    def do_POST(self):
         try:
+            content_type = self.headers.get('content-type')
+            
+            # Check if the content type is for a form with a file
+            if content_type and content_type.startswith('multipart/form-data'):
+                form = cgi.FieldStorage(
+                    fp=self.rfile,
+                    headers=self.headers,
+                    environ={'REQUEST_METHOD': 'POST',
+                             'CONTENT_TYPE': self.headers['Content-Type']}
+                )
+                
+                source = form.getvalue('source', '').decode('utf-8')
+                num_options = int(form.getvalue('numOptions', '5').decode('utf-8'))
+                api_key = form.getvalue('apiKey', '').decode('utf-8')
+                
+                text_content = ""
+                if source == 'pdf':
+                    if 'pdf' in form:
+                        pdf_item = form['pdf']
+                        pdf_file = io.BytesIO(pdf_item.file.read())
+                        with pdfplumber.open(pdf_file) as pdf:
+                            for page in pdf.pages:
+                                text_content += page.extract_text() or ""
+                
+            else:
+                content_length = int(self.headers['Content-Length'])
+                post_body = self.rfile.read(content_length).decode('utf-8')
+                data = json.loads(post_body)
+                
+                text_content = data.get('text', '')
+                num_options = data.get('numOptions', 5)
+                api_key = data.get('apiKey', '')
+                source = data.get('source', '')
+
+            if not text_content:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'No text or PDF content provided.'}).encode())
+                return
+
+            if not api_key:
+                self.send_response(401)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'No API key provided.'}).encode())
+                return
+
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(GEMINI_MODEL)
-            
-            response = model.generate_content(
-                contents=[{"role": "user", "parts": [{"text": prompt_template.format(text_chunk=text_chunk)}]}],
-                request_options={"timeout": 60}
-            )
-            raw_text = response.text.strip()
-            
-            match = re.search(r'```json\s*(\[.*?\])\s*```', raw_text, re.DOTALL)
-            json_str = match.group(1) if match else raw_text
+            model = genai.GenerativeModel('gemini-1.5-pro-latest')
 
-            extracted_data = json.loads(json_str)
-            return extracted_data if isinstance(extracted_data, list) else []
+            num_options_char = chr(ord('A') + num_options - 1)
+            
+            prompt = f"""
+            Generate a JSON array of multiple-choice questions (MCQs) from the following text.
+            Each question object in the array must have the following keys:
+            - question (string): The question text.
+            - option_a (string): Option A.
+            - option_b (string): Option B.
+            - option_c (string): Option C.
+            - option_d (string): Option D.
+            - option_e (string): Option E.
+            - correct_answer (string): The single letter of the correct option (e.g., "A").
 
+            The number of options per question should be {num_options}.
+            The correct answer should be one of the provided options.
+
+            TEXT:
+            {text_content}
+            """
+
+            response = model.generate_content(prompt, stream=False)
+            
+            mcqs_json_string = response.text.replace('```json', '').replace('```', '').strip()
+            mcqs_data = json.loads(mcqs_json_string)
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(mcqs_data).encode())
+
+        except json.JSONDecodeError as e:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': f'Invalid JSON in request body: {e}'}).encode())
         except Exception as e:
-            traceback.print_exc()
-            if i >= retries - 1:
-                return []
-    return []
-
-def process_text_and_create_excel(full_text, num_options, api_key):
-    """Process text input and return an in-memory Excel file."""
-    chunk_size = 3000
-    text_len = len(full_text)
-    all_data = []
-    num_chunks = (text_len // chunk_size) + 1
-    
-    prompt_template = get_mcq_prompt(num_options)
-
-    for i in range(0, text_len, chunk_size):
-        chunk = full_text[i:i + chunk_size]
-        chunk_data = call_gemini_api(chunk, prompt_template, api_key)
-        if chunk_data:
-            all_data.extend(chunk_data)
-
-    if not all_data:
-        return None, "No data was generated from the provided text."
-
-    try:
-        df = pd.DataFrame(all_data)
-
-        column_order = [
-            "question", "option_a", "option_b", "option_c", "option_d",
-            "correct_answer", "explanation", "topic", "chapter", "subject"
-        ]
-        if num_options == 5:
-            column_order.insert(4, "option_e")
-        else: # 4 options
-            column_order.remove("option_e")
-
-        existing_columns = [col for col in column_order if col in df.columns]
-        df = df[existing_columns]
-        df.insert(0, "S.No", range(1, len(df) + 1))
-
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="MCQs")
-        output.seek(0)
-        return output, None
-
-    except Exception as e:
-        traceback.print_exc()
-        return None, f"An error occurred while creating the Excel file: {e}"
-
-@app.route("/", defaults={"path": ""})
-@app.route("/<path:path>")
-def catch_all(path):
-    # This route is a placeholder to satisfy Vercel's build process.
-    # The vercel.json file handles routing requests to the correct functions.
-    return jsonify({"message": "API is running."})
-
-@app.route("/api/generate-mcqs-pdf", methods=["POST"])
-def generate_mcqs_from_pdf_route():
-    if "pdf" not in request.files:
-        return jsonify({"error": "No PDF file provided."}), 400
-    
-    pdf_file = request.files["pdf"]
-    api_key = request.form.get("apiKey")
-    num_options = int(request.form.get("numOptions", 5))
-
-    if not api_key:
-        return jsonify({"error": "API key is required."}), 400
-
-    filename = secure_filename(pdf_file.filename)
-    filepath = os.path.join("/tmp", filename)
-    pdf_file.save(filepath)
-
-    full_text = extract_text_from_pdf(filepath)
-    os.remove(filepath)
-    
-    if not full_text:
-        return jsonify({"error": "Could not extract text from PDF."}), 500
-    
-    excel_file, error = process_text_and_create_excel(full_text, num_options, api_key)
-
-    if error:
-        return jsonify({"error": error}), 500
-
-    return send_file(
-        excel_file,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        as_attachment=True,
-        download_name="generated_mcqs.xlsx"
-    )
-
-@app.route("/api/generate-mcqs-text", methods=["POST"])
-def generate_mcqs_from_text_route():
-    data = request.json
-    text_input = data.get("text")
-    api_key = data.get("apiKey")
-    num_options = int(data.get("numOptions", 5))
-
-    if not text_input or not api_key:
-        return jsonify({"error": "Text input and API key are required."}), 400
-    
-    excel_file, error = process_text_and_create_excel(text_input, num_options, api_key)
-
-    if error:
-        return jsonify({"error": error}), 500
-
-    return send_file(
-        excel_file,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        as_attachment=True,
-        download_name="generated_mcqs.xlsx"
-    )
-
-if __name__ == "__main__":
-    app.run(debug=True)
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': str(e)}).encode())
